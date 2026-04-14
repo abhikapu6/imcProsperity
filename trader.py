@@ -10,7 +10,8 @@ POS_LIMITS = {
 }
 
 TREND_SELL_PREMIUM = 6
-TREND_BUY_THRESHOLD = 4
+TREND_BUY_THRESHOLD = 3
+TREND_OPEN_THRESHOLD = 30  # aggressive open: take at ask_wall until this position
 
 
 class ProductTrader:
@@ -171,9 +172,14 @@ class TrendTrader(ProductTrader):
 
         fair = self.wall_mid
 
-        # 1. TAKING — aggressively buy anything up to fair + threshold
+        # 1. TAKING — aggressive open burst until TREND_OPEN_THRESHOLD, then normal
+        # When starting the day with low position, take at any ask (up to ask_wall)
+        # to front-load drift accumulation; after threshold, revert to selective taking.
+        take_ceiling = (self.ask_wall if self.ask_wall is not None
+                        and self.initial_position < TREND_OPEN_THRESHOLD
+                        else fair + TREND_BUY_THRESHOLD)
         for sp, sv in self.mkt_sell_orders.items():
-            if sp <= fair + TREND_BUY_THRESHOLD:
+            if sp <= take_ceiling:
                 self.bid(sp, sv)
 
         # Only sell at a large premium above fair
