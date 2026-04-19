@@ -11,32 +11,27 @@ POS_LIMITS = {
 
 TREND_SELL_PREMIUM = 6
 TREND_BUY_THRESHOLD = 3
-TREND_OPEN_THRESHOLD = 30  # aggressive open: take at ask_wall until this position
-
+TREND_OPEN_THRESHOLD = 60
+MAF_BID = 7421
 
 class ProductTrader:
-
     def __init__(self, name, state, prints, new_trader_data):
         self.orders = []
         self.name = name
         self.state = state
         self.prints = prints
         self.new_trader_data = new_trader_data
-
         self.last_trader_data = {}
         try:
             if self.state.traderData != '':
                 self.last_trader_data = json.loads(self.state.traderData)
         except:
             pass
-
         self.position_limit = POS_LIMITS.get(self.name, 50)
         self.initial_position = self.state.position.get(self.name, 0)
-
         self.mkt_buy_orders, self.mkt_sell_orders = self._parse_order_depth()
         self.bid_wall, self.wall_mid, self.ask_wall = self._find_walls()
         self.best_bid, self.best_ask = self._best_bid_ask()
-
         self.max_buy = self.position_limit - self.initial_position
         self.max_sell = self.position_limit + self.initial_position
 
@@ -44,14 +39,8 @@ class ProductTrader:
         buy_orders, sell_orders = {}, {}
         try:
             od: OrderDepth = self.state.order_depths[self.name]
-            buy_orders = {
-                bp: abs(bv)
-                for bp, bv in sorted(od.buy_orders.items(), key=lambda x: x[0], reverse=True)
-            }
-            sell_orders = {
-                sp: abs(sv)
-                for sp, sv in sorted(od.sell_orders.items(), key=lambda x: x[0])
-            }
+            buy_orders = {bp: abs(bv) for bp, bv in sorted(od.buy_orders.items(), key=lambda x: x[0], reverse=True)}
+            sell_orders = {sp: abs(sv) for sp, sv in sorted(od.sell_orders.items(), key=lambda x: x[0])}
         except:
             pass
         return buy_orders, sell_orders
@@ -108,10 +97,7 @@ class ProductTrader:
     def get_orders(self):
         return {self.name: self.orders}
 
-
 class StaticTrader(ProductTrader):
-    """Market maker for ASH_COATED_OSMIUM (fixed true price ~10,000)."""
-
     def __init__(self, state, prints, new_trader_data):
         super().__init__(STATIC_SYMBOL, state, prints, new_trader_data)
 
@@ -119,38 +105,38 @@ class StaticTrader(ProductTrader):
         if self.wall_mid is None:
             return {self.name: self.orders}
 
-        # 1. TAKING — immediately grab mispriced orders
+        fair = self.wall_mid - (self.initial_position * 0.05)
+
         for sp, sv in self.mkt_sell_orders.items():
-            if sp <= self.wall_mid - 1:
+            if sp <= fair - 1:
                 self.bid(sp, sv)
-            elif sp <= self.wall_mid and self.initial_position < 0:
+            elif sp <= fair and self.initial_position < 0:
                 self.bid(sp, min(sv, abs(self.initial_position)))
 
         for bp, bv in self.mkt_buy_orders.items():
-            if bp >= self.wall_mid + 1:
+            if bp >= fair + 1:
                 self.ask(bp, bv)
-            elif bp >= self.wall_mid and self.initial_position > 0:
+            elif bp >= fair and self.initial_position > 0:
                 self.ask(bp, min(bv, self.initial_position))
 
-        # 2. MAKING — overbid/undercut to capture queue priority
-        bid_price = int(self.bid_wall + 1)
-        ask_price = int(self.ask_wall - 1)
+        bid_price = int(self.bid_wall + 1) if self.bid_wall else int(fair - 1)
+        ask_price = int(self.ask_wall - 1) if self.ask_wall else int(fair + 1)
 
         for bp, bv in self.mkt_buy_orders.items():
             overbid = bp + 1
-            if bv > 1 and overbid < self.wall_mid:
+            if bv > 1 and overbid < fair:
                 bid_price = max(bid_price, overbid)
                 break
-            elif bp < self.wall_mid:
+            elif bp < fair:
                 bid_price = max(bid_price, bp)
                 break
 
         for sp, sv in self.mkt_sell_orders.items():
             undercut = sp - 1
-            if sv > 1 and undercut > self.wall_mid:
+            if sv > 1 and undercut > fair:
                 ask_price = min(ask_price, undercut)
                 break
-            elif sp > self.wall_mid:
+            elif sp > fair:
                 ask_price = min(ask_price, sp)
                 break
 
@@ -159,10 +145,7 @@ class StaticTrader(ProductTrader):
 
         return {self.name: self.orders}
 
-
 class TrendTrader(ProductTrader):
-    """Asymmetric long-biased market maker for INTARIAN_PEPPER_ROOT (deterministic uptrend)."""
-
     def __init__(self, state, prints, new_trader_data):
         super().__init__(TREND_SYMBOL, state, prints, new_trader_data)
 
@@ -171,23 +154,18 @@ class TrendTrader(ProductTrader):
             return {self.name: self.orders}
 
         fair = self.wall_mid
-
-        # 1. TAKING — aggressive open burst until TREND_OPEN_THRESHOLD, then normal
-        # When starting the day with low position, take at any ask (up to ask_wall)
-        # to front-load drift accumulation; after threshold, revert to selective taking.
         take_ceiling = (self.ask_wall if self.ask_wall is not None
                         and self.initial_position < TREND_OPEN_THRESHOLD
                         else fair + TREND_BUY_THRESHOLD)
+
         for sp, sv in self.mkt_sell_orders.items():
             if sp <= take_ceiling:
                 self.bid(sp, sv)
 
-        # Only sell at a large premium above fair
         for bp, bv in self.mkt_buy_orders.items():
             if bp >= fair + TREND_SELL_PREMIUM:
                 self.ask(bp, bv)
 
-        # 2. MAKING — aggressive buy side with overbidding, reluctant sell side
         bid_price = int(self.bid_wall + 1) if self.bid_wall is not None else int(fair - 1)
 
         for bp, bv in self.mkt_buy_orders.items():
@@ -207,8 +185,9 @@ class TrendTrader(ProductTrader):
 
         return {self.name: self.orders}
 
-
 class Trader:
+    def bid(self):
+        return MAF_BID
 
     def run(self, state: TradingState):
         result = {}
